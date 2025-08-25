@@ -135,6 +135,39 @@ def load_data():
         )
     ]
 
+    
+    # --- Proprietary 0–10 Team Density Score ---
+    # Base points by density bucket (tunable)
+    base_map = {
+        "2+ Days Rest": 2.0,
+        "1 Day Rest": 3.5,
+        "B2B": 6.5,
+        "4-in-6 Stretch Game": 7.5,
+        "B2B 4-in-6 Stretch Game": 8.5,
+    }
+
+    # base (fallback to lowest if missing)
+    sch["__base_pts"] = sch["Team_Density"].map(base_map).fillna(2.0)
+
+    # away bonus: +1 if away, else 0
+    is_away = sch["venue"].astype(str).str.title().eq("Away")
+    sch["__away_pts"] = np.where(is_away, 2.0, 0.0)
+
+    # travel component: up to +1.5 at 2000+ miles (capped)
+    miles = sch["Travel_Miles"].fillna(0)
+    sch["__travel_pts"] = np.minimum(miles, 2000) / 2000.0 * 1.5
+
+    # final score, clipped to 0..10 and rounded
+    sch["Team_Density_Score"] = (
+        sch["__base_pts"] + sch["__away_pts"] + sch["__travel_pts"]
+    ).clip(0, 10).round(1)
+
+    # game number within team/season (for x-axis)
+    sch = sch.sort_values(["season", "team", "gamedate"]).reset_index(drop=True)
+    sch["game_num"] = sch.groupby(["team", "season"]).cumcount() + 1
+
+    # cleanup helpers
+    schedule = sch.drop(columns=["__base_pts", "__away_pts", "__travel_pts"])
 
     # Finalize
     schedule = sch.drop(columns=[
@@ -165,13 +198,13 @@ season_display = {season_label(s): s for s in season_options}
 season_choice = st.selectbox("Season", list(season_display.keys()))
 season_selected = season_display[season_choice]
 
+season_df = schedule.loc[schedule["season"] == season_selected].copy()
+
 # Team selector (filtered by chosen season)
 teams_this_season = sorted(schedule.loc[schedule["season"] == season_selected, "team"].unique())
 # Try to preselect OKC if available (handy for the project)
 default_team_index = teams_this_season.index("OKC") if "OKC" in teams_this_season else 0
 team_selected = st.selectbox("Team", teams_this_season, index=default_team_index)
-
-
 
 # Filtered frame for downstream visuals
 view = (
@@ -187,6 +220,8 @@ st.dataframe(
     use_container_width=True
 )
 
+# ---- 14-day rolling game density (selected team/season) ----
+import altair as alt
 
 # Rolling count of games in the previous 14 calendar days (including game day)
 view2 = view.copy()
@@ -220,3 +255,46 @@ points = alt.Chart(view2).mark_circle(size=60).encode(
 chart = (line + points).properties(height=320).interactive()
 
 st.altair_chart(chart, use_container_width=True)
+
+st.subheader("Heatmap: Proprietary Game Density Score (0–10)")
+st.caption("Blue = easier ⟶ Red = tougher. Each cell is a game for a team in the selected season.")
+
+# All teams in the selected season (team-perspective scores)
+heat_df = schedule.loc[schedule["season"] == season_selected, [
+    "team", "game_num", "gamedate", "venue",
+    "Team_Density", "Travel_Miles", "Team_Density_Score"
+]].copy()
+
+# (Optional) order teams by average score so tougher schedules bubble to top
+team_order = (heat_df.groupby("team")["Team_Density_Score"]
+                      .mean()
+                      .sort_values(ascending=False)
+                      .index.tolist())
+
+heat = (
+    alt.Chart(heat_df)
+       .mark_rect()
+       .encode(
+           x=alt.X("game_num:O", title="Game #", axis=alt.Axis(labelAngle=0)),
+           y=alt.Y("team:N", sort=team_order, title="Team"),
+           color=alt.Color(
+               "Team_Density_Score:Q",
+               title="Score (0–10)",
+               scale=alt.Scale(scheme="redblue", domain=[0, 10], reverse=True)  # blue→red
+           ),
+           tooltip=[
+               alt.Tooltip("team:N", title="Team"),
+               alt.Tooltip("game_num:O", title="Game #"),
+               alt.Tooltip("gamedate:T", title="Date"),
+               alt.Tooltip("venue:N", title="Venue"),
+               alt.Tooltip("Team_Density:N", title="Density Bucket"),
+               alt.Tooltip("Travel_Miles:Q", title="Travel (mi)"),
+               alt.Tooltip("Team_Density_Score:Q", title="Score")
+           ]
+       )
+       .properties(height={"step": 28})  # row height per team
+       .interactive()
+)
+
+st.altair_chart(heat, use_container_width=True)
+
