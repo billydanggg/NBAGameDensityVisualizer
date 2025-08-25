@@ -170,6 +170,79 @@ teams_this_season = sorted(schedule.loc[schedule["season"] == season_selected, "
 default_team_index = teams_this_season.index("OKC") if "OKC" in teams_this_season else 0
 team_selected = st.selectbox("Team", teams_this_season, index=default_team_index)
 
+season_df = schedule.loc[schedule["season"] == season_selected].copy()
+
+# 2) Scoring components
+# Base points by density bucket (tweak freely)
+density_points = {
+    "B2B 4-in-6 Stretch Game": 10.0,
+    "4-in-6 Stretch Game"     : 8.0,
+    "B2B"                     : 7.0,
+    "1 Day Rest"              : 4.0,
+    "2+ Days Rest"            : 2.0
+}
+# Fallback for any missing/unknown label
+default_density_pts = 3.0
+
+# Home/Away bump (we’ll use venue column where "Home"/"Away")
+away_bump = 1.0
+home_bump = 0.0
+
+# Travel scaling: 0–3 pts based on miles (cap at 2500)
+def travel_component(miles):
+    if pd.isna(miles):
+        miles = 0.0
+    miles = min(max(miles, 0.0), 2500.0)
+    return 3.0 * (miles / 2500.0)
+
+# 3) Per-game TEAM score
+# Ensure we have the columns; if you used a different name tweak here.
+season_df["__density_base__"] = season_df["Team_Density"].map(density_points).fillna(default_density_pts)
+
+is_away = season_df["venue"].astype(str).str.title().eq("Away")
+season_df["__venue_bump__"] = np.where(is_away, away_bump, home_bump)
+season_df["__travel_pts__"] = season_df["Travel_Miles"].apply(travel_component)
+
+# Raw score, then clip to 0–10
+season_df["Team_Density_Score"] = (
+    season_df["__density_base__"] + season_df["__venue_bump__"] + season_df["__travel_pts__"]
+).clip(lower=0.0, upper=10.0)
+
+# 4) Aggregate to team-level (mean score for that season)
+team_heat = (season_df
+             .groupby("team", as_index=False)["Team_Density_Score"]
+             .mean())
+team_heat["Team_Density_Score"] = team_heat["Team_Density_Score"].round(2)
+
+# 5) Blue→Red heat map (low=blue, high=red)
+heat = (alt.Chart(team_heat)
+        .mark_rect()
+        .encode(
+            x=alt.X("metric:N",
+                    axis=alt.Axis(title=None, labels=False, ticks=False),
+                    sort=None),
+            y=alt.Y("team:N",
+                    title="Team",
+                    sort=alt.SortField(field="Team_Density_Score", order="descending")),
+            color=alt.Color("Team_Density_Score:Q",
+                            title="Density Score (0–10)",
+                            scale=alt.Scale(scheme="redblue", reverse=True, domain=[0, 10]))
+        )
+        .properties(height=26 * max(10, len(team_heat)//1), width=220))
+
+# Add text labels with the score
+labels = (alt.Chart(team_heat)
+          .mark_text(baseline='middle')
+          .encode(
+              x=alt.X("metric:N"),
+              y=alt.Y("team:N",
+                      sort=alt.SortField(field="Team_Density_Score", order="descending")),
+              text=alt.Text("Team_Density_Score:Q", format=".2f")
+          ))
+
+# Provide a single x category to form a column heatmap
+team_heat["metric"] = "Score"
+
 # Filtered frame for downstream visuals
 view = (
     schedule.loc[(schedule["season"] == season_selected) & (schedule["team"] == team_selected)]
